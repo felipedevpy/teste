@@ -1,0 +1,594 @@
+import sqlite3
+import threading
+import smtplib
+import os
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from kivy.app import App
+from kivy.lang import Builder
+from kivy.uix.screenmanager import ScreenManager, Screen, FadeTransition
+from kivy.uix.button import Button
+from kivy.core.window import Window
+from kivy.properties import StringProperty, ListProperty, NumericProperty
+
+NOME_BANCO = "scanner3.db"
+
+# --- CONFIGURAÇÕES DE E-MAIL DIRETO NO CÓDIGO ---
+SMTP_SERVER = "smtp.gmail.com"                      # Servidor do Google
+SMTP_PORT = 587                                      # Porta padrão TLS
+EMAIL_REMETENTE = "fulano@suaempresa.com"            # <-- Seu e-mail da empresa completo
+EMAIL_DESTINATARIO = "pablo_destinatario@email.com"   # <-- O e-mail do Pablo
+SENHA_REMETENTE = "sua_senha_aqui"                  # <-- Sua senha de app de 16 letras
+
+def criar_tabelas():
+    conn = sqlite3.connect(NOME_BANCO)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON")
+    cursor.execute("CREATE TABLE IF NOT EXISTS equipamentos (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT UNIQUE)")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pecas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            equipamento_id INTEGER, 
+            nome TEXT, 
+            sn_peca TEXT, 
+            slot TEXT,
+            FOREIGN KEY(equipamento_id) REFERENCES equipamentos(id),
+            UNIQUE(equipamento_id, sn_peca)
+        )
+    """)
+    try:
+        cursor.execute("ALTER TABLE pecas ADD COLUMN slot TEXT")
+    except sqlite3.OperationalError:
+        pass
+    cursor.execute("CREATE TABLE IF NOT EXISTS estoque (id INTEGER PRIMARY KEY AUTOINCREMENT, nome_peca TEXT UNIQUE, quantidade INTEGER)")
+    conn.commit()
+    conn.close()
+
+def enviar_email_alerta(nome_peca, quantidade):
+    """Função executada em segundo plano (Thread) para evitar travamentos no Kivy"""
+    if not SENHA_REMETENTE or SENHA_REMETENTE == "sua_senha_aqui":
+        print("ERRO: Senha de e-mail padrão detectada ou em branco! Configure a senha real no código.")
+        return
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_REMETENTE
+        msg['To'] = EMAIL_DESTINATARIO
+        msg['Subject'] = f"Alerta de Estoque Crítico: {nome_peca}"
+
+        corpo = f"Olá Pablo, faltam apenas {quantidade} unidades de {nome_peca} no estoque."
+        msg.attach(MIMEText(corpo, 'plain', 'utf-8'))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_REMETENTE, SENHA_REMETENTE)
+        server.sendmail(EMAIL_REMETENTE, EMAIL_DESTINATARIO, msg.as_string())
+        server.quit()
+        print(f"E-mail de alerta enviado com sucesso para {EMAIL_DESTINATARIO}!")
+    except Exception as e:
+        print(f"Falha ao enviar e-mail de alerta: {e}")
+
+def verificar_e_disparar_alerta(nome_peca, quantidade):
+    """Garante o disparo do e-mail se a quantidade for igual ou inferior a 2 unidades"""
+    if quantidade <= 2:
+        t = threading.Thread(target=enviar_email_alerta, args=(nome_peca, quantidade))
+        t.daemon = True
+        t.start()
+
+def adicionar_estoque_db(nome, qtd):
+    conn = sqlite3.connect(NOME_BANCO)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO estoque (nome_peca, quantidade) VALUES (?, ?)
+        ON CONFLICT(nome_peca) DO UPDATE SET quantidade = quantidade + ?
+    """, (nome, qtd, qtd))
+    
+    cursor.execute("SELECT quantidade FROM estoque WHERE nome_peca = ?", (nome,))
+    qtd_atual = cursor.fetchone()[0]
+    conn.commit()
+    conn.close()
+    
+    verificar_e_disparar_alerta(nome, qtd_atual)
+
+def descontar_estoque(nome_peca):
+    conn = sqlite3.connect(NOME_BANCO)
+    cursor = conn.cursor()
+    cursor.execute("SELECT quantidade FROM estoque WHERE nome_peca = ?", (nome_peca,))
+    res = cursor.fetchone()
+    if res and res[0] > 0:
+        nova_qtd = res[0] - 1
+        cursor.execute("UPDATE estoque SET quantidade = ? WHERE nome_peca = ?", (nova_qtd, nome_peca))
+        conn.commit()
+        conn.close()
+        
+        verificar_e_disparar_alerta(nome_peca, nova_qtd)
+        return True
+    conn.close()
+    return False
+
+def salvar_no_banco(serial_principal, nome_peca, sn_peca, slot):
+    conn = sqlite3.connect(NOME_BANCO)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO equipamentos (serial) VALUES (?)", (serial_principal,))
+    cursor.execute("SELECT id FROM equipamentos WHERE serial = ?", (serial_principal,))
+    equip_id = cursor.fetchone()[0]
+    try:
+        cursor.execute("""
+            INSERT INTO pecas (equipamento_id, nome, sn_peca, slot) 
+            VALUES (?, ?, ?, ?)
+        """, (equip_id, nome_peca, sn_peca, slot))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
+
+def buscar_peca_db(sn_peca):
+    conn = sqlite3.connect(NOME_BANCO)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT p.nome, e.serial, p.slot 
+        FROM pecas p
+        INNER JOIN equipamentos e ON e.id = p.equipamento_id
+        WHERE p.sn_peca = ?
+    """, (sn_peca,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+# --- ARQUITETURA DE DESIGN KV ---
+kv_string = '''
+#:set COLOR_PRIMARY [0.13, 0.49, 0.77, 1]
+#:set COLOR_PRIMARY_HOVER [0.18, 0.59, 0.90, 1]
+#:set COLOR_SUCCESS [0.13, 0.58, 0.33, 1]
+#:set COLOR_SUCCESS_HOVER [0.16, 0.70, 0.40, 1]
+#:set COLOR_NEUTRAL [0.4, 0.45, 0.5, 1]
+#:set COLOR_NEUTRAL_HOVER [0.5, 0.55, 0.6, 1]
+#:set COLOR_WARNING [0.85, 0.4, 0.15, 1]
+#:set COLOR_DANGER [0.75, 0.2, 0.2, 1]
+#:set COLOR_BACKGROUND [0.96, 0.96, 0.98, 1]
+#:set COLOR_TEXT [0.1, 0.1, 0.1, 1]
+
+<BotaoBase@Button>:
+    background_normal: ''
+    background_color: [0, 0, 0, 0]
+    color: [1, 1, 1, 1]
+    bold: True
+    font_size: '16sp'
+    size_hint_y: None
+    height: '55dp'
+    cor_normal: [0.2, 0.2, 0.2, 1]
+    cor_pressed: [0.1, 0.1, 0.1, 1]
+    canvas.before:
+        Color:
+            rgba: self.cor_normal if self.state == 'normal' else self.cor_pressed
+        RoundedRectangle:
+            size: self.size
+            pos: self.pos
+            radius: [8,]
+
+<BotaoPrincipal@BotaoBase>:
+    cor_normal: COLOR_PRIMARY
+    cor_pressed: COLOR_PRIMARY_HOVER
+
+<BotaoSucesso@BotaoBase>:
+    cor_normal: COLOR_SUCCESS
+    cor_pressed: COLOR_SUCCESS_HOVER
+    font_size: '17sp'
+    height: '60dp'
+
+<BotaoAcao@BotaoBase>:
+    cor_normal: COLOR_NEUTRAL
+    cor_pressed: COLOR_NEUTRAL_HOVER
+
+<RoundedTextInput@TextInput>:
+    background_normal: ''
+    background_active: ''
+    background_color: [1, 1, 1, 0]
+    cursor_color: COLOR_PRIMARY
+    foreground_color: COLOR_TEXT
+    multiline: False
+    size_hint_y: None
+    height: '50dp'
+    padding: [20, 15, 20, 15]
+    font_size: '16sp'
+    hint_text_color: [0.6, 0.6, 0.6, 1]
+    canvas.before:
+        Color:
+            rgba: [0.8, 0.8, 0.8, 1] if not self.focus else COLOR_PRIMARY
+        RoundedRectangle:
+            size: self.size
+            pos: self.pos
+            radius: [8,]
+        Color:
+            rgba: [1, 1, 1, 1]
+        RoundedRectangle:
+            size: [self.size[0]-2, self.size[1]-2]
+            pos: [self.pos[0]+1, self.pos[1]+1]
+            radius: [7,]
+
+<LabelTitulo@Label>:
+    font_size: '24sp'
+    bold: True
+    color: COLOR_TEXT
+    size_hint_y: None
+    height: '60dp'
+    halign: 'center'
+    valign: 'middle'
+    text_size: self.size
+
+<TelaMenu>:
+    canvas.before:
+        Color:
+            rgba: COLOR_BACKGROUND
+        Rectangle:
+            size: self.size
+            pos: self.pos
+    BoxLayout:
+        orientation: 'vertical'
+        padding: [40, 50, 40, 40]
+        spacing: 20
+        LabelTitulo:
+            text: "CONTROLE DE PRODUÇÃO"
+        BotaoPrincipal:
+            text: "ENTRADA DE ESTOQUE"
+            on_press: root.manager.current = 'estoque'
+        BotaoPrincipal:
+            text: "CONSULTAR LOCALIZAÇÃO"
+            on_press: root.manager.current = 'consulta'
+        Widget:
+            size_hint_y: None
+            height: '20dp'
+        Label:
+            text: "INICIAR NOVA MONTAGEM"
+            color: COLOR_NEUTRAL
+            font_size: '14sp'
+            bold: True
+            size_hint_y: None
+            height: '20dp'
+        RoundedTextInput:
+            id: entrada_sn
+            hint_text: "S/N do Equipamento (Ex: MQ123)"
+        BotaoSucesso:
+            text: "INICIAR MONTAGEM"
+            on_press: root.iniciar()
+
+<TelaEstoque>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 30
+        spacing: 18
+        LabelTitulo:
+            text: "ABASTECER ESTOQUE"
+        Spinner:
+            id: spinner_pecas
+            text: "Selecione o Componente"
+            values: ["Bomba Vácuo", "Fonte", "Display 5", "Display 7pol", "Placa Mãe", "Motor", "Relé"]
+            size_hint_y: None
+            height: '50dp'
+            background_normal: ''
+            background_color: [1, 1, 1, 1]
+            color: COLOR_TEXT
+            option_cls: 'SpinnerOptionCustom'
+            canvas.before:
+                Color:
+                    rgba: [0.8, 0.8, 0.8, 1]
+                RoundedRectangle:
+                    size: self.size
+                    pos: self.pos
+                    radius: [8,]
+        RoundedTextInput:
+            id: qtd_entrada
+            hint_text: "Quantidade"
+            input_filter: 'int'
+        BotaoSucesso:
+            text: "ADICIONAR"
+            on_press: root.adicionar()
+        BotaoAcao:
+            text: "VOLTAR"
+            on_press: root.manager.current = 'menu'
+
+<SpinnerOptionCustom@SpinnerOption>:
+    background_normal: ''
+    background_color: [1, 1, 1, 1]
+    color: COLOR_TEXT
+    height: '50dp'
+    canvas.before:
+        Color:
+            rgba: [0.95, 0.95, 0.95, 1] if self.state == 'normal' else [0.85, 0.85, 0.85, 1]
+        Rectangle:
+            size: self.size
+            pos: self.pos
+
+<TelaConsulta>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 30
+        spacing: 18
+        LabelTitulo:
+            text: "RASTREABILIDADE"
+        RoundedTextInput:
+            id: busca_sn
+            hint_text: "Bipe o S/N da PEÇA"
+        BotaoPrincipal:
+            text: "LOCALIZAR"
+            on_press: root.buscar()
+        Widget:
+            size_hint_y: None
+            height: '10dp'
+        Label:
+            id: resultado_busca
+            text: "Resultado aparecerá aqui"
+            halign: 'center'
+            valign: 'middle'
+            text_size: self.size
+            font_size: '17sp'
+            color: [0.2, 0.2, 0.2, 1]
+            padding: [15, 15]
+            canvas.before:
+                Color:
+                    rgba: [1, 1, 1, 0.8]
+                RoundedRectangle:
+                    size: self.size
+                    pos: self.pos
+                    radius: [10,]
+        BotaoAcao:
+            text: "VOLTAR"
+            on_press: root.manager.current = 'menu'
+
+<TelaSequencia>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 30
+        spacing: 15
+        Label:
+            text: "MONTANDO: " + root.serial_equip
+            color: COLOR_NEUTRAL
+            font_size: '15sp'
+            bold: True
+            size_hint_y: None
+            height: '25dp'
+        Label:
+            text: "PEÇA ATUAL:"
+            font_size: '14sp'
+            color: COLOR_TEXT
+            size_hint_y: None
+            height: '20dp'
+        Label:
+            text: root.peca_atual
+            font_size: '38sp'
+            bold: True
+            color: COLOR_PRIMARY
+            size_hint_y: None
+            height: '60dp'
+        Label:
+            id: aviso_estoque
+            text: ""
+            color: COLOR_DANGER
+            bold: True
+            font_size: '16sp'
+        BoxLayout:
+            size_hint_y: None
+            height: '60dp'
+            spacing: 20
+            BotaoAcao:
+                text: "PULAR"
+                cor_normal: COLOR_WARNING
+                cor_pressed: [0.7, 0.3, 0.1, 1]
+                on_press: root.pular_peca()
+            BotaoAcao:
+                text: "SAIR"
+                cor_normal: COLOR_DANGER
+                cor_pressed: [0.6, 0.1, 0.1, 1]
+                on_press: root.voltar_menu()
+
+<TelaSlot>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: [20, 30, 20, 20]
+        spacing: 20
+        Label:
+            text: "SELECIONE O SLOT PARA " + root.peca_nome
+            size_hint_y: None
+            height: '40dp'
+            bold: True
+            font_size: '18sp'
+            color: COLOR_TEXT
+        ScrollView:
+            GridLayout:
+                id: grid_slots
+                cols: 4
+                spacing: 15
+                padding: [10, 10, 10, 10]
+                size_hint_y: None
+                height: self.minimum_height
+
+<TelaFinalizado>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 50
+        spacing: 30
+        Label:
+            text: "MONTAGEM FINALIZADA!"
+            font_size: '28sp'
+            bold: True
+            color: COLOR_SUCCESS
+        ScrollView:
+            Label:
+                id: label_resumo
+                text: ""
+                halign: 'center'
+                valign: 'top'
+                text_size: self.size
+                font_size: '16sp'
+                color: COLOR_TEXT
+                padding: [15, 15]
+                canvas.before:
+                    Color:
+                        rgba: [1, 1, 1, 0.8]
+                    RoundedRectangle:
+                        size: self.size
+                        pos: self.pos
+                        radius: [10,]
+        BotaoSucesso:
+            text: "CONCLUIR"
+            on_press: root.reiniciar()
+'''
+
+Builder.load_string(kv_string)
+
+class TelaMenu(Screen):
+    def iniciar(self):
+        sn = self.ids.entrada_sn.text.strip()
+        if sn:
+            seq = self.manager.get_screen('sequencia')
+            seq.serial_equip = sn
+            seq.indice_passo = 0
+            seq.pecas_registradas = []
+            seq.lista_pecas = ["Bomba Vácuo", "Fonte", "Display 5", "Display 7pol", "Placa Mãe", "Motor", "Relé"]
+            self.manager.current = 'sequencia'
+
+class TelaEstoque(Screen):
+    def adicionar(self):
+        peca = self.ids.spinner_pecas.text
+        qtd = self.ids.qtd_entrada.text
+        if peca != "Selecione o Componente" and qtd:
+            adicionar_estoque_db(peca, int(qtd))
+            self.ids.qtd_entrada.text = ""
+
+class TelaConsulta(Screen):
+    def buscar(self):
+        sn = self.ids.busca_sn.text.strip()
+        if sn:
+            res = buscar_peca_db(sn)
+            if res:
+                self.ids.resultado_busca.text = (
+                    f"COMPONENTES: {res[0]}\n"
+                    f"MÁQUINA DESTINO: {res[1]}\n"
+                    f"SLOT INSTALADO: {res[2]}"
+                )
+            else:
+                self.ids.resultado_busca.text = "S/N NÃO ENCONTRADO!"
+
+class TelaSequencia(Screen):
+    serial_equip = StringProperty("")
+    lista_pecas = ListProperty([])
+    pecas_registradas = ListProperty([])
+    indice_passo = NumericProperty(0)
+    peca_atual = StringProperty("")
+    buffer_leitor = ""
+
+    def on_enter(self):
+        Window.bind(on_key_down=self._capturar_leitor)
+        self.verificar_fim()
+
+    def on_leave(self):
+        Window.unbind(on_key_down=self._capturar_leitor)
+
+    def verificar_fim(self):
+        if self.indice_passo >= len(self.lista_pecas):
+            final = self.manager.get_screen('finalizado')
+            final.historico = self.pecas_registradas
+            self.manager.current = 'finalizado'
+        else:
+            self.peca_atual = self.lista_pecas[self.indice_passo]
+            self.ids.aviso_estoque.text = ""
+
+    def _capturar_leitor(self, window, key, scancode, codepoint, modifiers):
+        if key == 8: return False
+        if key == 13:
+            if self.buffer_leitor:
+                if descontar_estoque(self.peca_atual):
+                    self.ir_para_slot(self.buffer_leitor)
+                else:
+                    # IMPLEMENTAÇÃO DA OPÇÃO 1:
+                    # Se falhar o desconto (estoque zerado), registra como pulado por falta e avança!
+                    self.pecas_registradas.append(f"{self.peca_atual}: PULADO (SEM ESTOQUE)")
+                    self.indice_passo += 1
+                    self.verificar_fim()
+                self.buffer_leitor = ""
+            return True
+        if codepoint:
+            self.buffer_leitor += codepoint
+            return True
+        return False
+
+    def ir_para_slot(self, sn_lido):
+        tela_slot = self.manager.get_screen('slots')
+        tela_slot.serial_equip = self.serial_equip
+        tela_slot.peca_nome = self.peca_atual
+        tela_slot.peca_sn = sn_lido
+        self.manager.current = 'slots'
+
+    def pular_peca(self):
+        self.pecas_registradas.append(f"{self.peca_atual}: PULADO (MANUAL)")
+        self.indice_passo += 1
+        self.verificar_fim()
+
+    def voltar_menu(self):
+        self.manager.current = 'menu'
+
+class TelaSlot(Screen):
+    serial_equip = ""
+    peca_nome = StringProperty("")
+    peca_sn = ""
+
+    def on_enter(self):
+        self.ids.grid_slots.clear_widgets()
+        for s in ['A','B','C']:
+            for i in range(1, 5):
+                btn = Button(
+                    text=f"{s}{i}", 
+                    size_hint=[None, None],
+                    size=['100dp', '60dp'],
+                    background_normal='',
+                    background_color=[0, 0, 0, 0], 
+                    color=[1, 1, 1, 1],
+                    bold=True,
+                    font_size='18sp'
+                )
+                
+                with btn.canvas.before:
+                    Color(rgba=[0.13, 0.49, 0.77, 1])
+                    RoundedRectangle(size=btn.size, pos=btn.pos, radius=[8,])
+                
+                btn.bind(pos=self._update_canvas, size=self._update_canvas)
+                btn.bind(on_press=self.salvar)
+                self.ids.grid_slots.add_widget(btn)
+
+    def _update_canvas(self, instance, value):
+        instance.canvas.before.clear()
+        with instance.canvas.before:
+            color = [0.18, 0.59, 0.90, 1] if instance.state == 'down' else [0.13, 0.49, 0.77, 1]
+            Color(rgba=color)
+            RoundedRectangle(size=instance.size, pos=instance.pos, radius=[8,])
+
+    def salvar(self, instancia):
+        salvar_no_banco(self.serial_equip, self.peca_nome, self.peca_sn, instancia.text)
+        seq = self.manager.get_screen('sequencia')
+        seq.pecas_registradas.append(f"{self.peca_nome}: {self.peca_sn} (Slot {instancia.text})")
+        seq.indice_passo += 1
+        self.manager.current = 'sequencia'
+
+class TelaFinalizado(Screen):
+    historico = ListProperty([])
+    def on_enter(self):
+        self.ids.label_resumo.text = "RELATÓRIO FINAL:\n\n" + "\n".join(self.historico)
+    def reiniciar(self):
+        self.manager.current = 'menu'
+
+class AppScanner(App):
+    def build(self): 
+        Window.clearcolor = [0.96, 0.96, 0.98, 1]
+        criar_tabelas()
+        sm = ScreenManager(transition=FadeTransition(duration=0.15))
+        sm.add_widget(TelaMenu(name='menu'))
+        sm.add_widget(TelaEstoque(name='estoque'))
+        sm.add_widget(TelaConsulta(name='consulta'))
+        sm.add_widget(TelaSequencia(name='sequencia'))
+        sm.add_widget(TelaSlot(name='slots'))
+        sm.add_widget(TelaFinalizado(name='finalizado'))
+        return sm
+
+if __name__ == '__main__':
+    AppScanner().run()
