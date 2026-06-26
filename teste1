@@ -1,7 +1,9 @@
-import sqlite3
+import os
 import threading
 import smtplib
-import os
+import qrcode
+import platform
+import mysql.connector
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from kivy.app import App
@@ -11,132 +13,185 @@ from kivy.uix.button import Button
 from kivy.core.window import Window
 from kivy.properties import StringProperty, ListProperty, NumericProperty
 
-NOME_BANCO = "scanner3.db"
+# --- CONFIGURAÇÃO INTELIGENTE E AUTOMÁTICA DO BANCO DE DADOS ---
+if platform.system() == "Windows":
+    # Configuração para o seu ambiente de testes no Windows
+    DB_CONFIG = {
+        "host": "localhost",
+        "port": 3307,                 
+        "user": "root",               
+        "password": "",               
+        "database": "scanner3"        
+    }
+else:
+    # Configuração para o ambiente de produção no Raspberry Pi 4 (Debian)
+    DB_CONFIG = {
+        "host": "localhost",
+        "port": 3306,                        # Porta padrão do MariaDB no Linux
+        "user": "root",               
+        "password": "sua_senha_do_raspberry", # <--- COLOQUE A SENHA QUE VOCÊ DEFINIU NO MARIADB AQUI
+        "database": "scanner3"        
+    }
 
-# --- CONFIGURAÇÕES DE E-MAIL DIRETO NO CÓDIGO ---
-SMTP_SERVER = "smtp.gmail.com"                      # Servidor do Google
-SMTP_PORT = 587                                      # Porta padrão TLS
-EMAIL_REMETENTE = "fulano@suaempresa.com"            # <-- Seu e-mail da empresa completo
-EMAIL_DESTINATARIO = "pablo_destinatario@email.com"   # <-- O e-mail do Pablo
-SENHA_REMETENTE = "sua_senha_aqui"                  # <-- Sua senha de app de 16 letras
+# --- CONFIGURAÇÕES DE E-MAIL ---
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_REMETENTE = "fulano@suaempresa.com"
+EMAIL_DESTINATARIO = "pablo_destinatario@email.com"
+SENHA_REMETENTE = "sua_senha_aqui"
+
+# Pasta local onde as imagens .png os QR Codes serão salvas
+OS_QRCODE_DIR = "qrcodes"
+os.makedirs(OS_QRCODE_DIR, exist_ok=True)
+
+def obter_conexao():
+    return mysql.connector.connect(**DB_CONFIG)
 
 def criar_tabelas():
-    conn = sqlite3.connect(NOME_BANCO)
+    conn = obter_conexao()
     cursor = conn.cursor()
-    cursor.execute("PRAGMA foreign_keys = ON")
-    cursor.execute("CREATE TABLE IF NOT EXISTS equipamentos (id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT UNIQUE)")
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS equipamentos (
+            id INT AUTO_INCREMENT PRIMARY KEY, 
+            serial VARCHAR(255) UNIQUE
+        )
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS pecas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            equipamento_id INTEGER, 
-            nome TEXT, 
-            sn_peca TEXT, 
-            slot TEXT,
+            id INT AUTO_INCREMENT PRIMARY KEY, 
+            equipamento_id INT, 
+            nome VARCHAR(255), 
+            sn_peca VARCHAR(255), 
+            slot VARCHAR(50),
             FOREIGN KEY(equipamento_id) REFERENCES equipamentos(id),
             UNIQUE(equipamento_id, sn_peca)
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE pecas ADD COLUMN slot TEXT")
-    except sqlite3.OperationalError:
-        pass
-    cursor.execute("CREATE TABLE IF NOT EXISTS estoque (id INTEGER PRIMARY KEY AUTOINCREMENT, nome_peca TEXT UNIQUE, quantidade INTEGER)")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS estoque (
+            id INT AUTO_INCREMENT PRIMARY KEY, 
+            nome_peca VARCHAR(255) UNIQUE, 
+            quantidade INT
+        )
+    """)
     conn.commit()
     conn.close()
 
-def enviar_email_alerta(nome_peca, quantidade):
-    """Função executada em segundo plano (Thread) para evitar travamentos no Kivy"""
-    if not SENHA_REMETENTE or SENHA_REMETENTE == "sua_senha_aqui":
-        print("ERRO: Senha de e-mail padrão detectada ou em branco! Configure a senha real no código.")
-        return
+def gerar_proximo_serial(nome_peca):
+    conn = obter_conexao()
+    cursor = conn.cursor()
+    prefixo = nome_peca.upper().replace(" ", "_").replace("Ú", "U").replace("Ã", "A")
+    
+    cursor.execute("SELECT sn_peca FROM pecas WHERE nome = %s ORDER BY id DESC LIMIT 1", (nome_peca,))
+    res = cursor.fetchone()
+    conn.close()
+    
+    if res:
+        ultimo_sn = res[0]
+        try:
+            ultimo_numero = int(ultimo_sn.split("-")[-1])
+            proximo_numero = ultimo_numero + 1
+        except (ValueError, IndexError):
+            proximo_numero = 1
+    else:
+        proximo_numero = 1
+        
+    return f"{prefixo}-{proximo_numero:04d}"
 
+def gerar_imagem_qrcode(conteudo_serial):
+    caminho_arquivo = os.path.join(OS_QRCODE_DIR, f"{conteudo_serial}.png")
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(conteudo_serial)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    img.save(caminho_arquivo)
+    return caminho_arquivo
+
+def enviar_email_alerta(nome_peca, quantidade):
+    if not SENHA_REMETENTE or SENHA_REMETENTE == "sua_senha_aqui":
+        return
     try:
         msg = MIMEMultipart()
         msg['From'] = EMAIL_REMETENTE
         msg['To'] = EMAIL_DESTINATARIO
         msg['Subject'] = f"Alerta de Estoque Crítico: {nome_peca}"
-
         corpo = f"Olá Pablo, faltam apenas {quantidade} unidades de {nome_peca} no estoque."
         msg.attach(MIMEText(corpo, 'plain', 'utf-8'))
-
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
         server.login(EMAIL_REMETENTE, SENHA_REMETENTE)
         server.sendmail(EMAIL_REMETENTE, EMAIL_DESTINATARIO, msg.as_string())
         server.quit()
-        print(f"E-mail de alerta enviado com sucesso para {EMAIL_DESTINATARIO}!")
     except Exception as e:
-        print(f"Falha ao enviar e-mail de alerta: {e}")
+        print(f"Falha ao enviar e-mail: {e}")
 
 def verificar_e_disparar_alerta(nome_peca, quantidade):
-    """Garante o disparo do e-mail se a quantidade for igual ou inferior a 2 unidades"""
     if quantidade <= 2:
         t = threading.Thread(target=enviar_email_alerta, args=(nome_peca, quantidade))
         t.daemon = True
         t.start()
 
 def adicionar_estoque_db(nome, qtd):
-    conn = sqlite3.connect(NOME_BANCO)
+    conn = obter_conexao()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO estoque (nome_peca, quantidade) VALUES (?, ?)
-        ON CONFLICT(nome_peca) DO UPDATE SET quantidade = quantidade + ?
-    """, (nome, qtd, qtd))
+        INSERT INTO estoque (nome_peca, quantidade) VALUES (%s, %s)
+        ON DUPLICATE KEY UPDATE quantidade = quantidade + VALUES(quantidade)
+    """, (nome, qtd))
     
-    cursor.execute("SELECT quantidade FROM estoque WHERE nome_peca = ?", (nome,))
+    cursor.execute("SELECT quantidade FROM estoque WHERE nome_peca = %s", (nome,))
     qtd_atual = cursor.fetchone()[0]
     conn.commit()
     conn.close()
-    
     verificar_e_disparar_alerta(nome, qtd_atual)
 
 def descontar_estoque(nome_peca):
-    conn = sqlite3.connect(NOME_BANCO)
+    conn = obter_conexao()
     cursor = conn.cursor()
-    cursor.execute("SELECT quantidade FROM estoque WHERE nome_peca = ?", (nome_peca,))
+    cursor.execute("SELECT quantidade FROM estoque WHERE nome_peca = %s", (nome_peca,))
     res = cursor.fetchone()
     if res and res[0] > 0:
         nova_qtd = res[0] - 1
-        cursor.execute("UPDATE estoque SET quantidade = ? WHERE nome_peca = ?", (nova_qtd, nome_peca))
+        cursor.execute("UPDATE estoque SET quantidade = %s WHERE nome_peca = %s", (nova_qtd, nome_peca))
         conn.commit()
         conn.close()
-        
         verificar_e_disparar_alerta(nome_peca, nova_qtd)
         return True
     conn.close()
     return False
 
 def salvar_no_banco(serial_principal, nome_peca, sn_peca, slot):
-    conn = sqlite3.connect(NOME_BANCO)
+    conn = obter_conexao()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO equipamentos (serial) VALUES (?)", (serial_principal,))
-    cursor.execute("SELECT id FROM equipamentos WHERE serial = ?", (serial_principal,))
+    cursor.execute("INSERT IGNORE INTO equipamentos (serial) VALUES (%s)", (serial_principal,))
+    cursor.execute("SELECT id FROM equipamentos WHERE serial = %s", (serial_principal,))
     equip_id = cursor.fetchone()[0]
     try:
         cursor.execute("""
             INSERT INTO pecas (equipamento_id, nome, sn_peca, slot) 
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
         """, (equip_id, nome_peca, sn_peca, slot))
         conn.commit()
-    except sqlite3.IntegrityError:
+    except mysql.connector.IntegrityError:
         pass
     finally:
         conn.close()
 
 def buscar_peca_db(sn_peca):
-    conn = sqlite3.connect(NOME_BANCO)
+    conn = obter_conexao()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT p.nome, e.serial, p.slot 
         FROM pecas p
         INNER JOIN equipamentos e ON e.id = p.equipamento_id
-        WHERE p.sn_peca = ?
+        WHERE p.sn_peca = %s
     """, (sn_peca,))
     res = cursor.fetchone()
     conn.close()
     return res
 
-# --- ARQUITETURA DE DESIGN KV ---
+# --- INTERFACE KIVY (KV STRING) ---
 kv_string = '''
 #:set COLOR_PRIMARY [0.13, 0.49, 0.77, 1]
 #:set COLOR_PRIMARY_HOVER [0.18, 0.59, 0.90, 1]
@@ -309,7 +364,7 @@ kv_string = '''
             text: "RASTREABILIDADE"
         RoundedTextInput:
             id: busca_sn
-            hint_text: "Bipe o S/N da PEÇA"
+            hint_text: "Insira ou bipe o S/N"
         BotaoPrincipal:
             text: "LOCALIZAR"
             on_press: root.buscar()
@@ -367,6 +422,13 @@ kv_string = '''
             color: COLOR_DANGER
             bold: True
             font_size: '16sp'
+            size_hint_y: None
+            height: '30dp'
+        
+        BotaoSucesso:
+            text: "GERAR QR CODE PROGRESSIVO"
+            on_press: root.processar_geracao_qrcode()
+
         BoxLayout:
             size_hint_y: None
             height: '60dp'
@@ -394,6 +456,12 @@ kv_string = '''
             bold: True
             font_size: '18sp'
             color: COLOR_TEXT
+        Label:
+            text: "QR CODE GERADO: " + root.peca_sn
+            size_hint_y: None
+            height: '20dp'
+            font_size: '14sp'
+            color: COLOR_NEUTRAL
         ScrollView:
             GridLayout:
                 id: grid_slots
@@ -476,14 +544,9 @@ class TelaSequencia(Screen):
     pecas_registradas = ListProperty([])
     indice_passo = NumericProperty(0)
     peca_atual = StringProperty("")
-    buffer_leitor = ""
 
     def on_enter(self):
-        Window.bind(on_key_down=self._capturar_leitor)
         self.verificar_fim()
-
-    def on_leave(self):
-        Window.unbind(on_key_down=self._capturar_leitor)
 
     def verificar_fim(self):
         if self.indice_passo >= len(self.lista_pecas):
@@ -494,30 +557,20 @@ class TelaSequencia(Screen):
             self.peca_atual = self.lista_pecas[self.indice_passo]
             self.ids.aviso_estoque.text = ""
 
-    def _capturar_leitor(self, window, key, scancode, codepoint, modifiers):
-        if key == 8: return False
-        if key == 13:
-            if self.buffer_leitor:
-                if descontar_estoque(self.peca_atual):
-                    self.ir_para_slot(self.buffer_leitor)
-                else:
-                    # IMPLEMENTAÇÃO DA OPÇÃO 1:
-                    # Se falhar o desconto (estoque zerado), registra como pulado por falta e avança!
-                    self.pecas_registradas.append(f"{self.peca_atual}: PULADO (SEM ESTOQUE)")
-                    self.indice_passo += 1
-                    self.verificar_fim()
-                self.buffer_leitor = ""
-            return True
-        if codepoint:
-            self.buffer_leitor += codepoint
-            return True
-        return False
+    def processar_geracao_qrcode(self):
+        if descontar_estoque(self.peca_atual):
+            serial_gerado = gerar_proximo_serial(self.peca_atual)
+            caminho_imagem = gerar_imagem_qrcode(serial_gerado)
+            print(f"QR Code salvo com sucesso: {caminho_imagem}")
+            self.ir_para_slot(serial_gerado)
+        else:
+            self.ids.aviso_estoque.text = f"SEM ESTOQUE DISPONÍVEL PARA: {self.peca_atual}"
 
-    def ir_para_slot(self, sn_lido):
+    def ir_para_slot(self, sn_gerado):
         tela_slot = self.manager.get_screen('slots')
         tela_slot.serial_equip = self.serial_equip
         tela_slot.peca_nome = self.peca_atual
-        tela_slot.peca_sn = sn_lido
+        tela_slot.peca_sn = sn_gerado
         self.manager.current = 'slots'
 
     def pular_peca(self):
@@ -531,7 +584,7 @@ class TelaSequencia(Screen):
 class TelaSlot(Screen):
     serial_equip = ""
     peca_nome = StringProperty("")
-    peca_sn = ""
+    peca_sn = StringProperty("")
 
     def on_enter(self):
         self.ids.grid_slots.clear_widgets()
